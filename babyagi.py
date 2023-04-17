@@ -1,21 +1,31 @@
 import os
-import subprocess
 import time
 from collections import deque
 from typing import Dict, List
 import importlib
-from local_memory import LocalMemory
 import json
 import openai
 from colorama import Fore
 import pinecone
 from dotenv import load_dotenv
 
+# import local modules
+from local_memory import LocalMemory
+from ai_responses import get_ada_embedding, openai_call
+from task_agent import TaskAgent
+
 # Load default environment variables (.env)
 load_dotenv()
 
-# Other configs
-BABY_NAME = os.getenv('BABY_NAME')
+# Starting configuation
+DEFAULT_BABY_NAME = os.getenv('BABY_NAME')
+BABY_NAME = input(f"Give this toddler a name: (default: {DEFAULT_BABY_NAME}): ").strip()
+if BABY_NAME=='':
+    BABY_NAME==DEFAULT_BABY_NAME
+DEFAULT_OBJECTIVE = os.getenv("OBJECTIVE", "")
+OBJECTIVE = input(f"Give the AI an objective (default: {DEFAULT_OBJECTIVE}): ").strip()
+if OBJECTIVE=='':
+    OBJECTIVE=DEFAULT_OBJECTIVE
 
 # API Keys
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -43,9 +53,6 @@ assert (
 YOUR_TABLE_NAME = os.getenv("TABLE_NAME", "")
 assert YOUR_TABLE_NAME, "TABLE_NAME environment variable is missing from .env"
 
-# Starting configuation
-# OBJECTIVE = os.getenv("OBJECTIVE", "")
-OBJECTIVE = input("Give the AI an objective: ")
 DEBUG_MODE = os.getenv("DEBUG_MODE")=='TRUE'
 INITIAL_TASK = os.getenv("INITIAL_TASK", os.getenv("FIRST_TASK", ""))
 
@@ -135,12 +142,12 @@ except:
 
 
 # Identify/Create file for saving results
-saved_results_file = f'saved_results/{BABY_NAME}_results.txt'
-with open(saved_results_file, 'w') as f:
-    f.write(
-        f"""AGI Name: {BABY_NAME}
-        OBJECTIVE: {OBJECTIVE}\n\n"""
-    )
+saved_results_folder = f'saved_results/{BABY_NAME}'
+if not os.path.exists(saved_results_folder):
+    os.mkdir(saved_results_folder)
+else:
+    for file in os.listdir(saved_results_folder):
+        os.unlink(os.path.join(saved_results_folder, file))
 
 # Task list
 task_list = deque([])
@@ -150,58 +157,7 @@ def add_task(task: Dict):
     task_list.append(task)
 
 
-def get_ada_embedding(text):
-    text = text.replace("\n", " ")
-    return openai.Embedding.create(input=[text], model="text-embedding-ada-002")["data"][0]["embedding"]
-
-
-def openai_call(
-    prompt: str,
-    model: str = OPENAI_API_MODEL,
-    temperature: float = OPENAI_TEMPERATURE,
-    max_tokens: int = 200,
-):
-    while True:
-        try:
-            if model.startswith("llama"):
-                # Spawn a subprocess to run llama.cpp
-                cmd = ["llama/main", "-p", prompt]
-                result = subprocess.run(cmd, shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
-                return result.stdout.strip()
-            elif not model.startswith("gpt-"):
-                # Use completion API
-                response = openai.Completion.create(
-                    engine=model,
-                    prompt=prompt,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    top_p=1,
-                    frequency_penalty=0,
-                    presence_penalty=0,
-                )
-                return response.choices[0].text.strip()
-            else:
-                # Use chat completion API
-                messages = [{"role": "system", "content": prompt}]
-                response = openai.ChatCompletion.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    n=1,
-                    stop=None,
-                )
-                return response.choices[0].message.content.strip()
-        except openai.error.RateLimitError:
-            print(
-                "The OpenAI API rate limit has been exceeded. Waiting 10 seconds and trying again."
-            )
-            time.sleep(10)  # Wait 10 seconds and try again
-        else:
-            break
-
-
-def project_complete_agent(objective: str, finished_list, to_do_list: List[str], debug=False):
+def project_manager_agent(objective: str, finished_list, to_do_list: List[str], debug=False):
     prompt = f"""
     You are a project overseer AI that determins if the following objective has been successfully reached: {objective}
     Several AI execution agents have been working on tasks to complete the objective.
@@ -209,25 +165,24 @@ def project_complete_agent(objective: str, finished_list, to_do_list: List[str],
     Incomplete tasks: {', '.join(to_do_list)}
     Respond with a JSON object that can be parsed by json.loads() and is structured:"""+"""'''
     {
-        project_status: '<complete|incomplete>', 
-        incomplete_tasks: ['Do this thing', 'Do other thing']
+        project_status: '<COMPLETE|IN_PROGRESS|IMPOSSIBLE>', 
+        project_phase: '<PLANNING|EXECUTION|REVIEW>',
+        incomplete_tasks: ['Do this thing', 'Do other thing'], 
+        overseer_comment: '<brief comment>'
     }'''
     Do not include anything but the JSON object in your response.
     Response:"""
     if debug:
         print(f'Project Complete Agent Prompt:\n{prompt}')
     try:
-        response_json = json.loads(openai_call(prompt))
+        response_json = json.loads(openai_call(prompt, model=OPENAI_API_MODEL, temperature=OPENAI_TEMPERATURE))
     except json.decoder.JSONDecodeError:
         print("JSON parse failed! Trying again with more tokens allowed.")
-        response_json = json.loads(openai_call(prompt, max_tokens=300))
+        response_json = json.loads(openai_call(prompt, model=OPENAI_API_MODEL, temperature=OPENAI_TEMPERATURE, max_tokens=300))
     if debug:
         print(f'Project agent response:\n{response_json}')
     
-    if response_json['project_status'] == 'complete':
-        return 'PROJECT_COMPLETE'
-    else:
-        return response_json['incomplete_tasks']
+    return response_json
 
 
 def prioritization_agent(completed_tasks, incomplete_tasks, debug=False):
@@ -241,54 +196,24 @@ def prioritization_agent(completed_tasks, incomplete_tasks, debug=False):
     {
         prioritized_tasks: ['priority 1 task', 'priority 2 task']
     }'''
-    Your response should only contain the JSON object and be parsable by json.loads().
-    Reponse:"""
+    Do not include anything but the JSON object in your response.
+    Response:"""
 
+    response = openai_call(prompt, model=OPENAI_API_MODEL, temperature=OPENAI_TEMPERATURE).strip()
     try:
-        response_json = json.loads(openai_call(prompt).strip())
-        new_tasks = json.loads(response_json)['prioritized_tasks']
+        response_json = json.loads(response)
     except json.decoder.JSONDecodeError:
         print("JSON load fail! Trying again with more tokens")
-        response_json = json.loads(openai_call(prompt, max_tokens=300).strip())
+        print(f"Received text: \n{response}")
+        response_json = json.loads(openai_call(prompt, model=OPENAI_API_MODEL, temperature=OPENAI_TEMPERATURE, max_tokens=300).strip())
     
-    new_tasks = json.loads(response_json)['prioritized_tasks']
+    new_tasks = response_json['prioritized_tasks']
     
     if debug:
         print(f'Prioritization Resopnse:\n{response_json}')
 
     
     return new_tasks
-
-
-def execution_agent(objective: str, task: str, debug=False) -> str:
-    """
-    Executes a task based on the given objective and previous context.
-
-    Args:
-        objective (str): The objective or goal for the AI to perform the task.
-        task (str): The task to be executed by the AI.
-
-    Returns:
-        str: The response generated by the AI for the given task.
-
-    """
-    context = task['context']
-    # print("\n*******RELEVANT CONTEXT******\n")
-    # print(context)
-    prompt = f"""
-    You are an AI who performs one task based on the following objective: {objective}\n.
-    Take into account these previously completed tasks: {context}\n.
-    Your task: {task}\n"""
-    if task['feedback']:
-        last_attempt = task['task_result']
-        last_feedback = task['feedback']
-        prompt += f"Your previous attempt: {last_attempt}\nYour manager's feedback on your previous attempt: {last_feedback}\n"
-    
-    prompt += 'Response:'
-    if debug:
-        print(f'EXECUTION AGENT PROMPT:\n{prompt}')
-    task_result = openai_call(prompt, max_tokens=2000)
-    return {'task_context': context, 'task_result': task_result}
 
 
 def context_agent(query: str, top_results_num: int):
@@ -311,22 +236,6 @@ def context_agent(query: str, top_results_num: int):
     return [(str(item.metadata["task"])) for item in sorted_results]
 
 
-def feedback_agent(task_result, debug=False):
-    # determines if the task has been satisfactorily completed, or if the objective has been reached
-    prompt = f"""
-    You are an AI who manages other AI agents in completing tasks with the ultimate objective: {OBJECTIVE}
-    Take into account these previously completed tasks: {task_result['context']}
-    Your subordinate's result for the task: {task_result['task_name']}
-    '''{task_result}'''
-    If the task has been completed satisfactorily answer 'TASK_COMPLETED' followed by a brief explanation of why. Otherwise answer with feedback for your agent to help them complete the task properly.
-    Response:"""
-    
-    if debug:
-        print(f'FEEDBACK:\n{prompt}')
-        
-    result = openai_call(prompt, max_tokens=2000)
-    
-    return(result)
 
 completed_tasks = []
 
@@ -337,7 +246,7 @@ add_task(first_task)
 # Main loop
 task_id_counter = 0
 mask_task_counter = 30
-project_status = 'STARTED'
+project_phase = 'PLANNING'
 debugging = DEBUG_MODE
 while True:
     task_id_counter += 1
@@ -351,56 +260,48 @@ while True:
         for t in task_list:
             print(str(t["task_id"]) + ": " + t["task_name"])
 
-        # Step 1: Pull the first task
+        # Step 1: Pull the first task from the list
         task = task_list.popleft()
+        if task['task_name'].strip() == 'None':
+            print(Fore.RED + "\n>>> No tasks remaining!\n" + Fore.RESET)
         print("\033[92m\033[1m" + "\n*****NEXT TASK*****\n" + "\033[0m\033[0m")
         print(str(task["task_id"]) + ": " + task["task_name"])
 
-        enriched_result = {
+        active_task = {
             "task_id": task['task_id'], 
             "task_name": task['task_name'], 
             "context":  context_agent(query=task["task_name"], top_results_num=5), 
             "feedback": None
         }  
         
-        for exec_try in range(5):
-            # Send to execution function to complete the task based on the context
-            result = execution_agent(OBJECTIVE, enriched_result, debugging)
-            result_text = result['task_result']
-            this_task_id = int(enriched_result["task_id"])
-            print("\033[93m\033[1m" + "\n*****TASK RESULT*****\n" + "\033[0m\033[0m")
-            print(result['task_result'])
+        # Step 2: Spin up an execution agent and ask it to complete the given task
+        execution_agent = TaskAgent(
+            OBJECTIVE, task_name=active_task['task_name'], context=active_task['context'], debug=debugging)
+        task_status = execution_agent.complete_task()
+        active_task['result'] = execution_agent.result
 
-            # Step 2: Enrich result and store in Pinecone/Memory
-            enriched_result["task_result"] = result_text
-            
-            # ask managing agent if task was completed properly or not
-            mgmt_feedback = feedback_agent(enriched_result, debugging)
-            if 'TASK_COMPLETED' in mgmt_feedback:
-                print("\033[92m\033[1m" + f"\n{mgmt_feedback}\n" + "\033[0m\033[0m")
-                enriched_result['approval_note'] = mgmt_feedback
-                enriched_result['feedback'] = None
-                completed_tasks.append(enriched_result)
-                with open(saved_results_file, 'a') as f:
-                    f.write(
-                        f"""
-                        Task: {enriched_result['task_id']}. {enriched_result['task_name']}
-                        Result: {enriched_result['task_result']}
-                        """
+        this_task_id = int(active_task["task_id"])
+        print("\033[93m\033[1m" + "\n*****TASK RESULT*****\n" + "\033[0m\033[0m")
+        print(active_task['result'])
+
+        # Step 3: Save the results of the task
+        completed_tasks.append(active_task)
+        with open(os.path.join(saved_results_folder, f"{project_phase}.txt"), 'a') as f:
+            f.write(
+                f"""
+Task: {active_task['task_id']}. {active_task['task_name']}
+Result: {active_task['result']}
+"""
                     )
-                break
-            else:
-                print(Fore.MAGENTA + f'FEEDBACK:\n{mgmt_feedback}' + Fore.RESET)
-                enriched_result['feedback'] = mgmt_feedback
         
-        # store the data in memory
+        # step 4: Store the task in memory
         result_id = f"result_{task['task_id']}"
         vector = get_ada_embedding(
-            enriched_result["task_result"]
+            active_task["result"]
         )  # get vector of the actual result extracted from the dictionary
         index.upsert(
-            [(result_id, vector, {"task": enriched_result["task_name"], "result": enriched_result['task_result']})],
-	    namespace=OBJECTIVE
+            [(result_id, vector, {"task": active_task["task_name"], "result": active_task['result']})], 
+            namespace=OBJECTIVE
         )
         
         completed_task_names = [str(x['task_id']) + '. ' + x['task_name'] for x in completed_tasks]
@@ -408,19 +309,25 @@ while True:
 
         # send list of completed/unfinished tasks to overseer for feedback
         if task_id_counter>1:
-            overseer_feedback = project_complete_agent(
+            overseer_feedback = project_manager_agent(
                 OBJECTIVE, 
                 completed_task_names, 
                 to_do_task_names,
                 debug=debugging
             )
-            print(Fore.LIGHTRED_EX + f'\n>>> Project status: {project_status}\n' + Fore.RESET)
-
-            if overseer_feedback == 'PROJECT_COMPLETE':
-                print("Finished with the project!")
+            
+            project_status = overseer_feedback['project_status']
+            project_phase = overseer_feedback['project_phase']
+            overseer_comment = overseer_feedback['overseer_comment']
+            to_do_task_names = overseer_feedback['incomplete_tasks']
+            if overseer_feedback['project_status'] == 'COMPLETE':
+                print(Fore.LIGHTRED_EX + f'\n>>> Project status: COMPLETE\n>>> Comment: {overseer_comment}\n' + Fore.RESET)
                 break
             else:
-                to_do_task_names = overseer_feedback
+                print(Fore.LIGHTRED_EX + f'\n>>> Project status: {project_status}\n>>> Comment: {overseer_comment}\n' + Fore.RESET)
+                if project_status=='IMPOSSIBLE':
+                    break
+
 
         
         prioritized_tasks = prioritization_agent(completed_tasks, to_do_task_names, debugging)
