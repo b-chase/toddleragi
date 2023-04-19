@@ -127,7 +127,7 @@ metric = "cosine"
 pod_type = "p1"
 
 try:
-    if os.getenv('USE_MEMORY')=='local':
+    if os.getenv('MEMORY_TYPE')=='local':
         raise Exception('Using local storage for memory...')
     if table_name not in pinecone.list_indexes():
         pinecone.create_index(
@@ -282,7 +282,9 @@ while True:
 
         this_task_id = int(active_task["task_id"])
         print("\033[93m\033[1m" + "\n*****TASK RESULT*****\n" + "\033[0m\033[0m")
+        print(f'Task completed: "{active_task["task_id"]}. {active_task["task_name"]}"')
         print(active_task['result'])
+        print(Fore.GREEN + f'\n>> Manager feedback: {execution_agent.feedback}\n'+Fore.RESET)
 
         # Step 3: Save the results of the task
         completed_tasks.append(active_task)
@@ -339,6 +341,10 @@ Result: {active_task['result']}
                 'task_id': next_task_id, 
                 'task_name': to_do_task
             })
+    
+    else:
+        print("Error! No task list!")
+        break
     
     if debugging:
         input('\n>>> DEBUG MODE: Press any key to continue ')
