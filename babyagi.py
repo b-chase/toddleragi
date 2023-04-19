@@ -264,6 +264,7 @@ while True:
         task = task_list.popleft()
         if task['task_name'].strip() == 'None':
             print(Fore.RED + "\n>>> No tasks remaining!\n" + Fore.RESET)
+            break
         print("\033[92m\033[1m" + "\n*****NEXT TASK*****\n" + "\033[0m\033[0m")
         print(str(task["task_id"]) + ": " + task["task_name"])
 
@@ -283,7 +284,7 @@ while True:
         this_task_id = int(active_task["task_id"])
         print("\033[93m\033[1m" + "\n*****TASK RESULT*****\n" + "\033[0m\033[0m")
         print(f'Task completed: "{active_task["task_id"]}. {active_task["task_name"]}"')
-        print(active_task['result'])
+        print(f"Task result: {active_task['result']}")
         print(Fore.GREEN + f'\n>> Manager feedback: {execution_agent.feedback}\n'+Fore.RESET)
 
         # Step 3: Save the results of the task
@@ -330,17 +331,15 @@ Result: {active_task['result']}
                 if project_status=='IMPOSSIBLE':
                     break
 
-
-        
         prioritized_tasks = prioritization_agent(completed_tasks, to_do_task_names, debugging)
+        next_task_id = this_task_id +1
         task_list = deque([])
-        next_task_id = this_task_id 
         for to_do_task in prioritized_tasks:
-            next_task_id += 1
             add_task({
                 'task_id': next_task_id, 
                 'task_name': to_do_task
             })
+            next_task_id += 1
     
     else:
         print("Error! No task list!")
